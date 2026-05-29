@@ -8,6 +8,13 @@
 ╚══════════════════════════════════════════════╝
 ```
 
+
+
+https://github.com/user-attachments/assets/74b4d266-2e1a-4cf9-ba64-93825e91643f
+
+
+
+
 A terminal music player that **moves and resizes your terminal window in sync
 with the beat** of whatever you're playing. Six choreographed patterns plus a
 physics-based Toyota Yaris lowrider bounce (YARIS MODE). Supports Hyprland,
