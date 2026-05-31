@@ -1,0 +1,180 @@
+# Copyright (C) 2024 Ymsniper
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""
+Entry point for Window Dance Player.
+
+Handles argument parsing, dependency checks, platform init, and launches
+the curses wrapper.  All heavy lifting is delegated to the sub-modules.
+"""
+
+import argparse
+import curses
+import os
+import sys
+import time
+from pathlib import Path
+
+from .logger           import DBG
+from .platform         import detect as _det
+from .platform         import hyprland as _hypr
+from .platform         import x11 as _x11
+from .platform.detect  import COMPOSITOR, PLATFORM, SESSION_TYPE
+from .platform.window  import get_screen_size, get_window_id, get_scale_factor
+from .player           import Player
+from .ui               import tui
+
+
+def check_deps() -> list:
+    """Return a list of missing Python package names."""
+    missing = []
+    for pkg in ("librosa", "pygame", "numpy"):
+        try:
+            __import__(pkg)
+        except ImportError:
+            missing.append(pkg)
+    return missing
+
+
+def _compositor_label() -> str:
+    """Human-readable description of the active window-control backend."""
+    if SESSION_TYPE != "wayland":
+        return "X11"
+    labels = {
+        "kde":      "KDE Wayland (KWin scripting)",
+        "hyprland": "Hyprland (direct IPC socket)",
+        "sway":     "Sway (i3-protocol IPC socket)",
+        "gnome":    "GNOME Wayland (unsupported — dance disabled)",
+        "unknown":  "Unknown Wayland compositor (dance disabled)",
+    }
+    return labels.get(COMPOSITOR, f"Wayland/{COMPOSITOR}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Window Dance Player — moves your terminal window on the beat",
+        epilog=(
+            "Controls: SPACE play/pause · N next · P prev · "
+            "D toggle dance · 1-6 pattern · I image overlay · Q quit"
+        ),
+    )
+    parser.add_argument(
+        "files",
+        nargs="+",
+        help="Audio files to play (MP3, WAV, FLAC, OGG, …)",
+    )
+    parser.add_argument(
+        "--image", "-i",
+        metavar="FILE",
+        default=None,
+        help=(
+            "Image to display as a full-terminal overlay that warps with Yaris "
+            "physics (PNG, JPEG, WEBP, GIF, … — any format Pillow supports). "
+            "Requires: pip install Pillow --break-system-packages. "
+            "You can also add / remove the image at runtime with the [I] key."
+        ),
+    )
+    args = parser.parse_args()
+
+    files = [Path(f) for f in args.files if Path(f).exists()]
+    if not files:
+        print("Error: no valid audio files found.")
+        sys.exit(1)
+
+    # ── Resolve image path (--image flag) ─────────────────────────────────────
+    image_path: "Path | None" = None
+    if args.image:
+        p = Path(args.image).expanduser()
+        if not p.exists():
+            print(f"Warning: --image path not found: {p}  (overlay disabled)")
+        else:
+            image_path = p
+
+    missing = check_deps()
+    if missing:
+        print(f"Missing packages: {', '.join(missing)}")
+        print(f"  pip install {' '.join(missing)} --break-system-packages")
+        print("  (CachyOS / Arch: sudo pacman -S python-pygame python-numpy,")
+        print("   then: pip install librosa --break-system-packages)")
+        sys.exit(1)
+
+    # ── Startup diagnostics (go to wdp_debug.log) ────────────────────────────
+    DBG("=== startup ===")
+    DBG(f"PLATFORM={PLATFORM} SESSION_TYPE={SESSION_TYPE} COMPOSITOR={COMPOSITOR}")
+    DBG(f"HYPRLAND_INSTANCE_SIGNATURE={os.environ.get('HYPRLAND_INSTANCE_SIGNATURE', '<not set>')!r}")
+    DBG(f"XDG_RUNTIME_DIR={os.environ.get('XDG_RUNTIME_DIR', '<not set>')!r}")
+    DBG(f"XDG_CURRENT_DESKTOP={os.environ.get('XDG_CURRENT_DESKTOP', '<not set>')!r}")
+    if image_path:
+        DBG(f"image_path={image_path!r}")
+
+    print(f"Session : {_compositor_label()}")
+    print("Getting window info…", end="", flush=True)
+
+    window_id = get_window_id()
+    sw, sh    = get_screen_size()
+    scale     = get_scale_factor()
+
+    if not window_id:
+        print("\nWarning: could not detect window — dance disabled.")
+        if SESSION_TYPE == "wayland":
+            if COMPOSITOR == "gnome":
+                print("GNOME Wayland does not support programmatic window moving without an extension.")
+            elif COMPOSITOR == "unknown":
+                print("Unknown compositor. Supported: KDE Plasma, Hyprland, Sway.")
+        else:
+            print("Linux X11: install xdotool → sudo pacman -S xdotool")
+    else:
+        scale_s = f"  scale={scale:.2f}×" if scale != 1.0 else ""
+        print(f" OK  (backend={window_id}, screen={sw}×{sh}{scale_s})")
+
+    # ── Image overlay dependency hint ─────────────────────────────────────────
+    if image_path is not None:
+        try:
+            from PIL import Image  # noqa: F401
+        except ImportError:
+            print(
+                "⚠  Pillow not found — image overlay disabled.\n"
+                "   pip install Pillow --break-system-packages"
+            )
+            image_path = None
+
+    # ── Warm up IPC paths and fast X11 handle ────────────────────────────────
+    if COMPOSITOR == "hyprland":
+        _hypr._init_hyprland_sock()
+        DBG(f"Hyprland socket cached: {_hypr._HYPR_SOCK!r}")
+    if SESSION_TYPE == "x11":
+        _x11._init_x11_fast()
+
+    # Tighten GIL switch interval so the physics thread gets CPU time more
+    # reliably.  Default is 5 ms; 1 ms reduces frame-time jitter noticeably.
+    sys.setswitchinterval(0.001)
+
+    if SESSION_TYPE == "wayland" and (
+        window_id in ("kde", "sway")
+        or (isinstance(window_id, str) and window_id.startswith("hyprland"))
+    ):
+        print("⚠  Make sure your terminal window is FLOATING for dance to work.")
+        if COMPOSITOR == "hyprland":
+            print("   Hyprland: Super+V toggles float.")
+        elif COMPOSITOR == "sway":
+            print("   Sway: $mod+Shift+Space toggles float.")
+        elif COMPOSITOR == "kde":
+            print("   KDE: right-click titlebar → More Actions → Float.")
+
+    time.sleep(0.8)   # give the user a moment to read before curses takes over
+
+    player = Player(files)
+    try:
+        curses.wrapper(tui, player, window_id, sw, sh, image_path)
+    except KeyboardInterrupt:
+        player.stop()
+    finally:
+        try:
+            import pygame
+            pygame.mixer.quit()
+        except Exception:
+            pass
+        print("\n🎵  Thanks for dancing!")
+
+
+if __name__ == "__main__":
+    main()
